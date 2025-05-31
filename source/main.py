@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
-from handlers.datetime_handler import current_time
+from handlers.datetime_handler import current_formatted_time
 from handlers.logging_handler import setup_logger
 from services.bankrupt_parser_service import BankruptParserService
 from services.database_service import DatabaseService
@@ -41,6 +41,7 @@ class ParserThread(QThread):
             cards = await page.locator("app-bankrupt-result-card-company").all()
             self.log_signal.emit(f"Cards found: {len(cards)}")
 
+            # TODO: Add page offset changing
             for i, card in enumerate(cards):
                 if not self.is_running:
                     self.log_signal.emit("Parser stopped")
@@ -58,8 +59,8 @@ class ParserThread(QThread):
         except Exception as e:
             self.log_signal.emit(f"Parcing error: {str(e)}")
         finally:
-            # if page:
-            #     await page.close()
+            if page:
+                await page.close()
             self.finished_signal.emit()
 
 
@@ -75,7 +76,7 @@ class MainWindow(QMainWindow):
         self.parser_service = BankruptParserService()
 
         # Logger setup
-        self.logger = setup_logger("App", "Logs", f"App_Log_{current_time()}.log")
+        self.logger = setup_logger("App", "Logs", f"App_Log_{current_formatted_time()}.log")
 
         # UI initialization
         self.init_ui()

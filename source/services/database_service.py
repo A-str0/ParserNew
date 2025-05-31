@@ -1,5 +1,5 @@
 import sqlite3
-from handlers.datetime_handler import current_time
+from handlers.datetime_handler import current_formatted_time, current_time
 from handlers.logging_handler import setup_logger, logging
 
 class DatabaseService:
@@ -9,7 +9,7 @@ class DatabaseService:
 
     def __init__(self, db_path: str = "database.db"):
         # Setup logger
-        cur_time: str = current_time()
+        cur_time: str = current_formatted_time()
         log_filename: str = f"Database_Log_{cur_time}.log"
         self.logger = setup_logger("Database", "Logs", log_filename)
 
@@ -57,7 +57,7 @@ class DatabaseService:
                     status INTEGER,
                     url TEXT,
                     region_id INTEGER,
-                    created_at TEXT,
+                    created_at DATETIME,
                     FOREIGN KEY (region_id) REFERENCES regions(Id)
                 )"""
                 self.conn.execute(query)
