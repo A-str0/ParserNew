@@ -1,8 +1,4 @@
-import sys
-import asyncio
-import os
-import tempfile
-import csv
+import sys, asyncio, os, json, time
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QTableWidget, QTableWidgetItem,
@@ -14,9 +10,10 @@ from PyQt5.QtGui import QFont
 from handlers.datetime_handler import current_formatted_time
 from handlers.logging_handler import setup_logger
 from handlers.format_handler import format_email_subject
+from handlers.exceptions import QuitException
 from services.bankrupt_parser_service import BankruptParserService
 from services.database_service import DatabaseService
-from services.email_serivce import EmailService
+from services.email_service import EmailService
 from bs4 import BeautifulSoup
 
 
@@ -26,16 +23,20 @@ class ParserThread(QThread):
     finished_signal = pyqtSignal()
 
 
-    def __init__(self, parser: BankruptParserService, region_ids: list[int], parse_full_info: bool, js_wait_time: int, smtp_config: dict, email_service: EmailService):
+    def __init__(self, parser: BankruptParserService, region_ids: list[int], check_publication_date: bool, js_wait_time: int, smtp_config: dict, email_service: EmailService, url_template: str, email_subject_template: str, email_body_template: str, email_interval: int):
         super().__init__()
         self.parser = parser
         self.region_ids = region_ids
-        self.parse_full_info = parse_full_info
+        self.check_publication_date = check_publication_date
         self.js_wait_time = js_wait_time
         self.smtp_config = smtp_config
         self.is_running = True
         self.email_service = email_service
-        self.base_url = "https://bankrot.fedresurs.ru/bankrupts"
+        self.url_template = url_template
+        self.email_subject_template = email_subject_template
+        self.email_body_template = email_body_template
+        self.email_interval = email_interval
+        self.last_email_time = 0
 
 
     def run(self):
@@ -43,16 +44,19 @@ class ParserThread(QThread):
 
 
     async def send_email(self, result: dict):
+        # Ensure minimum interval between email sends
+        if self.email_interval > 0:
+            current_time = time.monotonic()
+            elapsed = current_time - self.last_email_time
+            if elapsed < self.email_interval:
+                await asyncio.sleep(self.email_interval - elapsed)
+            self.last_email_time = time.monotonic()
+
         try:
-            # Format email subject
-            subject = format_email_subject( "Банкротство {} ", inn=result["inn"] )
-            
-            # Send email
-            self.email_service.send_email(
-                self.smtp_config,
-                subject,
-                f"Ссылка на публикацию: {result['url']}"
-            )
+            # subject = format_email_subject( "Банкротство {} ", inn=result["inn"] )
+            subject = self.email_subject_template.format(**result)
+            body = self.email_body_template.format(**result)
+            self.email_service.send_email(self.smtp_config, subject, body)
             self.log_signal.emit(f"Email sent for INN {result['inn']}")
         except Exception as e:
             self.log_signal.emit(f"Error sending email for INN {result['inn']}: {str(e)}")
@@ -66,56 +70,62 @@ class ParserThread(QThread):
                     self.log_signal.emit("Parser stopped")
                     break
 
+                if not self.parser.db_service.get_region_status(region_id):
+                    self.log_signal.emit(f"Region ({region_id}) status is 0, skiping")
+                    continue
+
+
                 self.log_signal.emit(f"Starting parsing for region ID: {region_id}")
-                url = f"{self.base_url}?regionId={region_id}&isActiveLegalCase=true&offset=0&limit=100"
+                url = self.url_template.format(region_id)
                 page = await self.parser.load_page(url, wait_time=self.js_wait_time)
                 await page.wait_for_selector("app-bankrupt-result-card-company")
-                
-                processed_inns = set()  # Track processed INNs to avoid duplicates
+
+                processed_inns = set()
 
                 while self.is_running:
                     cards = await page.locator("app-bankrupt-result-card-company").all()
                     self.log_signal.emit(f"Found cards: {len(cards)}")
-
                     new_cards_processed = False
-                    for i, card in enumerate(cards):
+
+                    for card in cards:
                         if not self.is_running:
                             self.log_signal.emit("Parser stopped")
                             break
-
                         try:
                             card_soup = BeautifulSoup(await card.inner_html(), "html.parser")
-                            self.parser.parse_full_info = self.parse_full_info
+                            self.parser.check_publication_date = self.check_publication_date
                             result = await self.parser.parse_card(page, card_soup, card, wait_time=self.js_wait_time)
                             if result and result["inn"] not in processed_inns:
                                 result["region_id"] = region_id
                                 processed_inns.add(result["inn"])
                                 self.result_signal.emit(result)
-                                self.log_signal.emit(f"Processed card {i}: INN={result['inn']}, URL={result['url']}")
-
-                                if result['url'] is not None:
+                                self.log_signal.emit(f"Processed card: INN={result['inn']}, URL={result['url']}")
+                                if result['url']:
                                     await self.send_email(result)
-
+                                new_cards_processed = True
+                        except QuitException as e:
+                            self.log_signal.emit(str(e))
+                            continue
                         except Exception as e:
-                            self.log_signal.emit(f"Error processing card {i}: {str(e)}")
+                            self.log_signal.emit(f"Error processing card: {str(e)}")
                             continue
 
-                        new_cards_processed = True
-
-                    if i == len(cards) - 1 and not new_cards_processed:
-                        # Check for more cards
-                        load_more_button = page.locator("button.btn.btn_load_more")
-                        if await load_more_button.is_visible() and await load_more_button.is_enabled() and new_cards_processed:
+                    # Pressing button 'Load more'
+                    load_more_button = page.get_by_role("button", name="Загрузить еще")
+                    if await load_more_button.is_visible() and await load_more_button.is_enabled():
+                        if new_cards_processed:
                             self.log_signal.emit("Clicking 'Load More' button")
                             await load_more_button.click()
                             await page.wait_for_timeout(self.js_wait_time)
                         else:
-                            self.log_signal.emit("No more cards to load or button disabled")
+                            self.log_signal.emit("No new cards processed, stopping")
                             break
+                    else:
+                        self.log_signal.emit("No 'Load More' button or disabled, stopping")
+                        break
 
                 if page:
                     await page.close()
-
         except Exception as e:
             self.log_signal.emit(f"Parsing error: {str(e)}")
         finally:
@@ -143,6 +153,9 @@ class MainWindow(QMainWindow):
         # Load regions
         self.populate_region_list()
 
+        # Load last settings
+        self.load_last_settings()
+
 
     def init_ui(self):
         # Setup the main UI
@@ -158,7 +171,7 @@ class MainWindow(QMainWindow):
 
         # Region file selection
         file_layout = QHBoxLayout()
-        self.select_file_button = QPushButton("Выбрать файл регионов")
+        self.select_file_button = QPushButton("Выбрать файл регионов (!Сбросит таблицу регионов в БД!)")
         self.select_file_button.clicked.connect(self.select_regions_file)
         file_layout.addWidget(self.select_file_button)
         self.file_label = QLabel("Файл не выбран")
@@ -183,7 +196,7 @@ class MainWindow(QMainWindow):
         settings_layout = QFormLayout()
         settings_group.setLayout(settings_layout)
 
-        self.full_info_checkbox = QCheckBox("Парсить полную информацию")
+        self.full_info_checkbox = QCheckBox("Проверять дату последней публикации")
         self.full_info_checkbox.setChecked(True)
         settings_layout.addRow("Режим парсинга:", self.full_info_checkbox)
 
@@ -193,6 +206,16 @@ class MainWindow(QMainWindow):
         self.js_wait_spinbox.setValue(3000)
         self.js_wait_spinbox.setSuffix(" мс")
         settings_layout.addRow("Интервал ожидания JS:", self.js_wait_spinbox)
+
+        self.url_template_edit = QLineEdit()
+        self.url_template_edit.setText("https://bankrot.fedresurs.ru/bankrupts?regionId={}&isActiveLegalCase=true&offset=0&limit=100")
+        settings_layout.addRow("URL шаблон:", self.url_template_edit)
+
+        self.request_interval_spin = QSpinBox()
+        self.request_interval_spin.setRange(0, 60)
+        self.request_interval_spin.setValue(5)
+        self.request_interval_spin.setSuffix(" с")
+        settings_layout.addRow("Интервал запросов:", self.request_interval_spin)
 
         control_layout.addWidget(settings_group)
 
@@ -219,6 +242,22 @@ class MainWindow(QMainWindow):
         self.email_recipient_edit = QLineEdit()
         email_layout.addRow("Получатель:", self.email_recipient_edit)
 
+        self.email_subject_template_edit = QLineEdit()
+        self.email_subject_template_edit.setText("Банкротство {inn}")
+        self.email_subject_template_edit.setToolTip("Доступные заполнители: {inn}, {status}, {url}, {region_id}")
+        email_layout.addRow("Шаблон темы:", self.email_subject_template_edit)
+
+        self.email_body_template_edit = QLineEdit()
+        self.email_body_template_edit.setText("Ссылка на публикацию: {url}")
+        self.email_body_template_edit.setToolTip("Доступные заполнители: {inn}, {status}, {url}, {region_id}")
+        email_layout.addRow("Шаблон тела:", self.email_body_template_edit)
+
+        self.email_interval_spin = QSpinBox()
+        self.email_interval_spin.setRange(0, 60)
+        self.email_interval_spin.setValue(10)
+        self.email_interval_spin.setSuffix(" с")
+        email_layout.addRow("Интервал email:", self.email_interval_spin)
+
         control_layout.addWidget(email_group)
 
         # Control buttons
@@ -232,6 +271,17 @@ class MainWindow(QMainWindow):
         parser_control_layout.addWidget(self.stop_button)
         parser_control_layout.addStretch()
         control_layout.addLayout(parser_control_layout)
+
+        # Settings buttons
+        settings_buttons_layout = QHBoxLayout()
+        self.save_settings_button = QPushButton("Сохранить настройки")
+        self.save_settings_button.clicked.connect(self.save_settings)
+        settings_buttons_layout.addWidget(self.save_settings_button)
+        self.load_settings_button = QPushButton("Загрузить настройки")
+        self.load_settings_button.clicked.connect(self.load_settings)
+        settings_buttons_layout.addWidget(self.load_settings_button)
+        settings_buttons_layout.addStretch()
+        control_layout.addLayout(settings_buttons_layout)
 
         # Results table
         self.result_table = QTableWidget()
@@ -299,6 +349,84 @@ class MainWindow(QMainWindow):
             item.setSelected(state == Qt.Checked)
 
 
+    def save_settings(self):
+        # Save current settings to a JSON file
+        file_path, _ = QFileDialog.getSaveFileName(self, "Сохранить настройки", "", "JSON файлы (*.json)")
+        if file_path:
+            try:
+                settings = {
+                    "url_template": self.url_template_edit.text(),
+                    "email_subject_template": self.email_subject_template_edit.text(),
+                    "email_body_template": self.email_body_template_edit.text(),
+                    "request_interval": self.request_interval_spin.value(),
+                    "email_interval": self.email_interval_spin.value(),
+                    "smtp_host": self.smtp_host_edit.text(),
+                    "smtp_port": self.smtp_port_edit.text(),
+                    "email_user": self.email_user_edit.text(),
+                    "email_password": self.email_pass_edit.text(),
+                    "email_recipient": self.email_recipient_edit.text(),
+                    "parse_full_info": self.full_info_checkbox.isChecked(),
+                    "js_wait_time": self.js_wait_spinbox.value()
+                }
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(settings, f, ensure_ascii=False, indent=4)
+                with open("last_settings.json", "w", encoding="utf-8") as f:
+                    json.dump(settings, f, ensure_ascii=False, indent=4)
+                self.logger.info(f"Settings saved to {file_path}")
+            except Exception as e:
+                self.logger.error(f"Error saving settings: {e}")
+                QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить настройки: {e}")
+
+
+    def load_settings(self):
+        # Load settings from a JSON file
+        file_path, _ = QFileDialog.getOpenFileName(self, "Загрузить настройки", "", "JSON файлы (*.json)")
+        if file_path:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                self.url_template_edit.setText(settings.get("url_template", ""))
+                self.email_subject_template_edit.setText(settings.get("email_subject_template", ""))
+                self.email_body_template_edit.setText(settings.get("email_body_template", ""))
+                self.request_interval_spin.setValue(settings.get("request_interval", 5))
+                self.email_interval_spin.setValue(settings.get("email_interval", 10))
+                self.smtp_host_edit.setText(settings.get("smtp_host", ""))
+                self.smtp_port_edit.setText(settings.get("smtp_port", "587"))
+                self.email_user_edit.setText(settings.get("email_user", ""))
+                self.email_pass_edit.setText(settings.get("email_password", ""))
+                self.email_recipient_edit.setText(settings.get("email_recipient", ""))
+                self.full_info_checkbox.setChecked(settings.get("parse_full_info", True))
+                self.js_wait_spinbox.setValue(settings.get("js_wait_time", 3000))
+                self.logger.info(f"Settings loaded from {file_path}")
+            except Exception as e:
+                self.logger.error(f"Error loading settings: {e}")
+                QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить настройки: {e}")
+
+
+    def load_last_settings(self):
+        # Load last saved settings
+        last_settings_file = "last_settings.json"
+        if os.path.exists(last_settings_file):
+            try:
+                with open(last_settings_file, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                self.url_template_edit.setText(settings.get("url_template", ""))
+                self.email_subject_template_edit.setText(settings.get("email_subject_template", ""))
+                self.email_body_template_edit.setText(settings.get("email_body_template", ""))
+                self.request_interval_spin.setValue(settings.get("request_interval", 5))
+                self.email_interval_spin.setValue(settings.get("email_interval", 10))
+                self.smtp_host_edit.setText(settings.get("smtp_host", ""))
+                self.smtp_port_edit.setText(settings.get("smtp_port", "587"))
+                self.email_user_edit.setText(settings.get("email_user", ""))
+                self.email_pass_edit.setText(settings.get("email_password", ""))
+                self.email_recipient_edit.setText(settings.get("email_recipient", ""))
+                self.full_info_checkbox.setChecked(settings.get("parse_full_info", True))
+                self.js_wait_spinbox.setValue(settings.get("js_wait_time", 3000))
+                self.logger.info("Loaded last settings")
+            except Exception as e:
+                self.logger.error(f"Error loading last settings: {e}")
+
+
     def start_parsing(self):
         # Start parsing for selected regions
         selected_items = self.region_list.selectedItems()
@@ -322,13 +450,18 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(True)
         self.result_table.setRowCount(0)
 
+        self.parser_service.set_request_interval(self.request_interval_spin.value())
         self.parser_thread = ParserThread(
             self.parser_service,
             region_ids,
             self.full_info_checkbox.isChecked(),
             self.js_wait_spinbox.value(),
             smtp_config,
-            self.email_service
+            self.email_service,
+            self.url_template_edit.text(),
+            self.email_subject_template_edit.text(),
+            self.email_body_template_edit.text(),
+            self.email_interval_spin.value()
         )
         self.parser_thread.log_signal.connect(self.update_log)
         self.parser_thread.result_signal.connect(self.update_table)

@@ -3,9 +3,12 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError, Browser, Page, Locator
 from handlers.datetime_handler import current_formatted_time
 from handlers.logging_handler import setup_logger, logging
-from handlers.decorators import with_interval
 from handlers.format_handler import format_url
+from handlers.exceptions import QuitException
 from services.database_service import DatabaseService
+import time
+import asyncio
+from datetime import datetime
 
 
 class BankruptParserService:
@@ -14,7 +17,7 @@ class BankruptParserService:
     db_service: DatabaseService = None
 
 
-    def __init__(self, db_service: DatabaseService, proxy_config=None, parse_full_info=True) -> None:
+    def __init__(self, db_service: DatabaseService, proxy_config=None, check_publication_date=True) -> None:
         # Setup logger
         cur_time: str = current_formatted_time()
         log_filename: str = f"BankruptParser_Log_{cur_time}.log"
@@ -25,10 +28,20 @@ class BankruptParserService:
         self.db_service = db_service
 
         # Flag to control whether to parse the full information page
-        self.parse_full_info = parse_full_info
+        self.check_publication_date = check_publication_date
+
+        # Request interval management
+        self.last_request_time = 0
+        self.request_interval = 0  # in seconds
+
+
+    def set_request_interval(self, interval: int):
+        # Set the minimum interval between requests
+        self.request_interval = interval
 
 
     async def organization_exists(self, inn: str) -> bool:
+        # Check if organization exists in database
         if not self.db_service:
             self.logger.error("Database service not initialized")
             return False
@@ -54,7 +67,15 @@ class BankruptParserService:
 
 
     async def load_page(self, url: str, wait_time: int = 3000) -> Page:
+        # Load a web page with interval enforcement
         self.logger.debug(f"Loading page ({url})...")
+        if self.request_interval > 0:
+            current_time = time.monotonic()
+            elapsed = current_time - self.last_request_time
+            if elapsed < self.request_interval:
+                await asyncio.sleep(self.request_interval - elapsed)
+            self.last_request_time = time.monotonic()
+
         try:
             if self.browser is None or not self.browser.is_connected():
                 self.logger.debug("Browser not initialized or disconnected, opening new browser")
@@ -71,7 +92,6 @@ class BankruptParserService:
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                     "Connection": "keep-alive"
                 },
-                # Emulate real browser metadata
                 permissions=["geolocation"],
                 geolocation={"latitude": 55.7558, "longitude": 37.6173},
                 locale="en-US",
@@ -106,41 +126,12 @@ class BankruptParserService:
         return popup_page
 
 
-    @with_interval(5)
-    async def make_request(self, url: str, params=None) -> rq.Response:
-        # Make an HTTP request with retries
-        self.logger.info(f"Sending request for {url} ({params})...")
-        try:
-            response = rq.get(
-                url,
-                params=params,
-                timeout=10,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept": "application/json, text/plain, */*"
-                },
-                proxies=self.proxy_config if self.proxy_config else None
-            )
-            response.raise_for_status()
-            return response
-        except rq.exceptions.HTTPError as e:
-            self.logger.error(f"HTTP Error: {e}")
-            raise
-        except rq.Timeout as e:
-            self.logger.error(f"Timeout Error: {e}")
-            raise
-        except Exception as e:
-            self.logger.error(f"Error while making request: {str(e)}")
-            raise
-
-
     async def parse_card(self, page: Page, card_soup: BeautifulSoup, card_locator: Locator, wait_time: int = 3000) -> dict:
         # Parse a single organization card
         try:
             # Check procedure status
             procedure_status: str = card_soup.find("div", class_="u-card-result__value u-card-result__value_cursor-def u-card-result__value_item-property u-card-result__value_width-item").text.strip()
-            if procedure_status == "Конкурсное производство":
+            if procedure_status != "Конкурсное производство":
                 return None
 
             # Parse INN
@@ -149,25 +140,36 @@ class BankruptParserService:
             
             # Check DB status for organization
             organization: list = self.db_service.get_organization(int(inn))
-            if organization[1] == 0:
+            if organization and  organization[1] == 0:
                 self.logger.debug(f"Organization with INN {inn} has status '0' in DB, skipping")
                 return None
-
-            # Check if full information parsing is disabled
-            if not self.parse_full_info:
-                self.logger.debug(f"Full info parsing disabled for INN: {inn}")
-                return {"inn": inn, "status": 1, "url": None}
 
             # Open popup page
             popup_page: Page = await self.expect_popup(page, card_locator, wait_time)
 
-            # Net responses logging
+            # Log network responses
             async def log_response(response):
                 self.logger.debug(f"Response: {response.url} - Status: {response.status}")
             popup_page.on("response", log_response)
 
             information_soup: BeautifulSoup = BeautifulSoup(await popup_page.content(), "html.parser").find("body")
-            last_publications = information_soup.find_all("div", class_="info-item")
+            last_publications = information_soup.find("information-page-item", attrs={"header" : "Публикации"}).find_all("div", class_="info-item")
+
+            # Check if parser should check card date
+            if self.check_publication_date:
+                self.logger.debug(f"Checking date for {inn}")
+
+                last_publication = last_publications[0]
+
+                last_publication_date_str: str = last_publication.find("div", class_="info-item-name d-flex align-self-start").text.strip().split()[-1]
+                last_publication_date = datetime.strptime(last_publication_date_str, "%d.%m.%Y").date()
+                self.logger.debug(f"Extracted publication date for INN {inn}: {last_publication_date}")
+
+                date_of_check = self.db_service.get_organization_date_of_check(inn)
+                if date_of_check:
+                    date_of_check = datetime.strptime(date_of_check.split()[0], "%d.%m.%Y").date()
+                    if last_publication_date < date_of_check:
+                        raise QuitException("Publication date is older then current date")
 
             publication_url = None
 
@@ -178,7 +180,7 @@ class BankruptParserService:
                     self.logger.debug(f"Matching publication found: {link}")
                     anchor = publication.find("a", class_="underlined")
                     if anchor:
-                        publication_url: str = anchor.get("href")
+                        publication_url: str = format_url(anchor.get("href"), "https://fedresurs.ru")
                         self.logger.debug(f"Publication URL for INN {inn}: {publication_url}")
                         break
 
@@ -211,7 +213,7 @@ class BankruptParserService:
                             link = publication.find("a", class_="underlined")
                             self.logger.debug(f"Matching publication found: {link}")
                             if link:
-                                publication_url: str = format_url(link.get("href"), "https://bankrot.fedresurs.ru")
+                                publication_url: str = format_url(link.get("href"), "https://fedresurs.ru")
                                 self.logger.debug(f"Publication URL for INN {inn}: {publication_url}")
                                 break
 

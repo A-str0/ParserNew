@@ -2,6 +2,7 @@ import sqlite3
 from handlers.datetime_handler import current_formatted_time, current_time
 from handlers.logging_handler import setup_logger, logging
 
+
 class DatabaseService:
     conn: sqlite3.Connection = None
     logger: logging.Logger = None
@@ -30,6 +31,7 @@ class DatabaseService:
 
 
     def create_regions_table(self) -> None:
+        # Create Regions table
         self.logger.info("Creating Regions table...")
 
         try:
@@ -48,17 +50,18 @@ class DatabaseService:
 
 
     def create_organizations_table(self) -> None:
+        # Create Organizations table
         self.logger.info("Creating Organizations table...")
 
         try:
             with self.conn:
                 query = """CREATE TABLE IF NOT EXISTS organizations (
-                    inn TEXT PRIMARY KEY,
-                    status INTEGER,
-                    url TEXT,
-                    region_id INTEGER,
-                    created_at DATETIME,
-                    FOREIGN KEY (region_id) REFERENCES regions(Id)
+                    INN TEXT PRIMARY KEY,
+                    Status INTEGER,
+                    URL TEXT,
+                    RegionId INTEGER,
+                    DateOfCheck DATETIME,
+                    FOREIGN KEY (RegionId) REFERENCES regions(Id)
                 )"""
                 self.conn.execute(query)
         except Exception as e:
@@ -69,11 +72,12 @@ class DatabaseService:
 
 
     def insert_organization(self, inn: str, status: int, url: str, region_id: int) -> None:
+        # Insert or replace organization
         self.logger.debug(f"Inserting organization: INN={inn}, Region={region_id}")
 
         try:
             with self.conn:
-                query = """INSERT OR REPLACE INTO organizations (inn, status, url, region_id, created_at)
+                query = """INSERT OR REPLACE INTO organizations (INN, Status, URL, RegionId, DateOfCheck)
                            VALUES (?, ?, ?, ?, ?)"""
                 self.conn.execute(query, (inn, status, url, region_id, current_time()))
         except Exception as e:
@@ -81,7 +85,7 @@ class DatabaseService:
             raise
 
 
-    def organization_exists(self, inn: int) -> bool:
+    def organization_exists(self, inn: str) -> bool:
         # Check if an organization with the given INN exists in the database
         try:
             with self.conn:
@@ -96,36 +100,59 @@ class DatabaseService:
 
 
     def get_organization(self, inn: str) -> list:
+        # Retrieve organization data
         try:
-            self.cursor.execute(
-                "SELECT inn, status, url, region_id FROM Organizations WHERE inn = ?",
-                (inn,)
-            )
-            result = self.cursor.fetchone()
-            if result:
-                self.logger.debug(f"Retrieved organization: INN {inn}")
-                return list(result)
-            else:
-                self.logger.debug(f"No organization found for INN {inn}")
-                return []
+            with self.conn:
+                cursor = self.conn.execute("SELECT INN, Status, URL, RegionId FROM organizations WHERE INN = ?",
+                (inn,))
+                result = cursor.fetchone()
+                if result:
+                    self.logger.debug(f"Retrieved organization: INN {inn}")
+                    return list(result)
+                else:
+                    self.logger.debug(f"No organization found for INN {inn}")
+                    return []
         except Exception as e:
             self.logger.error(f"Error retrieving organization INN {inn}: {e}")
             return []
 
 
+    def get_organization_date_of_check(self, inn: str) -> str:
+        try:
+            with self.conn:
+                cursor = self.conn.execute(
+                    "SELECT DateOfCheck FROM organizations WHERE INN = ?",
+                    (inn,)
+                )
+                result = cursor.fetchone()
+                if result:
+                    self.logger.debug(f"Retrieved created_at for INN {inn}: {result[0]}")
+                    return result[0]
+                else:
+                    self.logger.debug(f"No organization found for INN {inn}")
+                    return None
+        except Exception as e:
+            self.logger.error(f"Error retrieving created_at for INN {inn}: {e}")
+            return None
+
+
     def clear_regions(self) -> None:
+        # Clear regions table
         self.logger.debug("Clearing regions table")
+
         try:
             with self.conn:
                 self.conn.execute("DELETE FROM regions")
-            self.logger.info("Regions table cleared")
+                self.logger.info("Regions table cleared")
         except Exception as e:
             self.logger.error(f"Failed to clear regions table: {str(e)}")
             raise
 
 
-    def insert_region(self, region_id: int, name: str) -> None:
+    def insert_region(self, region_id: str, name: str) -> None:
+        # Insert or replace a region
         self.logger.debug(f"Inserting region: ID={region_id}, Name={name}")
+
         try:
             with self.conn:
                 query = """INSERT OR REPLACE INTO regions (Id, Name, Status)
@@ -135,9 +162,29 @@ class DatabaseService:
             self.logger.error(f"Failed to insert region {region_id}: {str(e)}")
             raise
 
+    
+    def get_region_status(self, id: int) -> bool:
+        self.logger.debug(f"Retrieving region ({id}) status")
 
-    def get_regions(self) -> list:
+        try:
+            with self.conn:
+                cursor = self.conn.execute("SELECT Status FROM regions WHERE Id = ?", (id,))
+                result = cursor.fetchone()
+                if result:
+                    self.logger.debug(f"Retrieved region ({id}) status {result}")
+                    return result
+                else:
+                    self.logger.debug(f"Region ({id}) status is NULL")
+                    return False
+        except Exception as e:
+            self.logger.error(f"Failed to Retrieve region ({id}) status: {str(e)}")
+            return False
+
+
+    def get_regions(self) -> list[tuple[int, str]]:
+        # Fetch all regions
         self.logger.debug("Fetching all regions")
+
         try:
             with self.conn:
                 cursor = self.conn.execute("SELECT Id, Name FROM regions ORDER BY Id")
@@ -147,8 +194,8 @@ class DatabaseService:
             return []
 
 
-    def __del__(self):
-        """Close the database connection when the object is destroyed."""
+def __del__(self):
+        # Close database connection
         if self.conn:
             self.conn.close()
             self.logger.debug("Database connection closed")
