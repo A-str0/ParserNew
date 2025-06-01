@@ -283,17 +283,6 @@ class MainWindow(QMainWindow):
         settings_buttons_layout.addStretch()
         control_layout.addLayout(settings_buttons_layout)
 
-        # Results table
-        self.result_table = QTableWidget()
-        self.result_table.setColumnCount(4)
-        self.result_table.setHorizontalHeaderLabels(["ИНН", "Статус", "URL", "Регион ID"])
-        self.result_table.setRowCount(0)
-        self.result_table.setColumnWidth(0, 150)
-        self.result_table.setColumnWidth(1, 100)
-        self.result_table.setColumnWidth(2, 600)
-        self.result_table.setColumnWidth(3, 100)
-        main_layout.addWidget(self.result_table)
-
         # Log area
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
@@ -365,7 +354,7 @@ class MainWindow(QMainWindow):
                     "email_user": self.email_user_edit.text(),
                     "email_password": self.email_pass_edit.text(),
                     "email_recipient": self.email_recipient_edit.text(),
-                    "parse_full_info": self.full_info_checkbox.isChecked(),
+                    "check_publication_date": self.full_info_checkbox.isChecked(),
                     "js_wait_time": self.js_wait_spinbox.value()
                 }
                 with open(file_path, "w", encoding="utf-8") as f:
@@ -395,7 +384,7 @@ class MainWindow(QMainWindow):
                 self.email_user_edit.setText(settings.get("email_user", ""))
                 self.email_pass_edit.setText(settings.get("email_password", ""))
                 self.email_recipient_edit.setText(settings.get("email_recipient", ""))
-                self.full_info_checkbox.setChecked(settings.get("parse_full_info", True))
+                self.full_info_checkbox.setChecked(settings.get("check_publication_date", True))
                 self.js_wait_spinbox.setValue(settings.get("js_wait_time", 3000))
                 self.logger.info(f"Settings loaded from {file_path}")
             except Exception as e:
@@ -420,7 +409,7 @@ class MainWindow(QMainWindow):
                 self.email_user_edit.setText(settings.get("email_user", ""))
                 self.email_pass_edit.setText(settings.get("email_password", ""))
                 self.email_recipient_edit.setText(settings.get("email_recipient", ""))
-                self.full_info_checkbox.setChecked(settings.get("parse_full_info", True))
+                self.full_info_checkbox.setChecked(settings.get("check_publication_date", True))
                 self.js_wait_spinbox.setValue(settings.get("js_wait_time", 3000))
                 self.logger.info("Loaded last settings")
             except Exception as e:
@@ -448,7 +437,6 @@ class MainWindow(QMainWindow):
 
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.result_table.setRowCount(0)
 
         self.parser_service.set_request_interval(self.request_interval_spin.value())
         self.parser_thread = ParserThread(
@@ -483,14 +471,6 @@ class MainWindow(QMainWindow):
 
 
     def update_table(self, result):
-        # Update results table with parsed data
-        row = self.result_table.rowCount()
-        self.result_table.insertRow(row)
-        self.result_table.setItem(row, 0, QTableWidgetItem(result["inn"]))
-        self.result_table.setItem(row, 1, QTableWidgetItem(str(result["status"])))
-        self.result_table.setItem(row, 2, QTableWidgetItem(result["url"] or "N/A"))
-        self.result_table.setItem(row, 3, QTableWidgetItem(str(result["region_id"])))
-
         try:
             self.db_service.insert_organization(
                 result["inn"], result["status"], result["url"], result["region_id"]

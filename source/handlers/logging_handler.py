@@ -1,6 +1,8 @@
 import logging
+from pathlib import Path
 
-def setup_logger(name: str, log_path: str, log_filename, level=logging.DEBUG) -> logging.Logger:
+def setup_logger(name: str, log_path: str, log_filename, level=logging.INFO) -> logging.Logger:
+
     logger = logging.getLogger(name)
 
     # Formatter
@@ -12,6 +14,7 @@ def setup_logger(name: str, log_path: str, log_filename, level=logging.DEBUG) ->
     logger.addHandler(ch)
 
     # File handler
+    Path(f"{log_path}").mkdir(parents=True, exist_ok=True)
     handler = logging.FileHandler(f"{log_path}\\{log_filename}", encoding="utf-8")    
     handler.formatter = formatter    
 

@@ -58,7 +58,7 @@ class BankruptParserService:
         self.logger.debug("Launching browser...")
         try:
             playwright = await async_playwright().start()
-            self.browser = await playwright.chromium.launch(headless=False)  # TODO: Change to True for production
+            self.browser = await playwright.chromium.launch(headless=True)  # TODO: Change to True for production
         except Exception as e:
             self.logger.error(f"Failed to launch browser: {e}")
             raise
