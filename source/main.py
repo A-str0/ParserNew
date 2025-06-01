@@ -1,17 +1,22 @@
 import sys
 import asyncio
+import os
+import tempfile
 import csv
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QTableWidget, QTableWidgetItem,
-    QComboBox, QLabel, QFileDialog, QMessageBox
+    QListWidget, QListWidgetItem, QCheckBox, QLabel, QFileDialog,
+    QMessageBox, QSpinBox, QGroupBox, QFormLayout, QLineEdit
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 from handlers.datetime_handler import current_formatted_time
 from handlers.logging_handler import setup_logger
+from handlers.format_handler import format_email_subject
 from services.bankrupt_parser_service import BankruptParserService
 from services.database_service import DatabaseService
+from services.email_serivce import EmailService
 from bs4 import BeautifulSoup
 
 
@@ -21,123 +26,310 @@ class ParserThread(QThread):
     finished_signal = pyqtSignal()
 
 
-    def __init__(self, parser: BankruptParserService, region_id: int):
+    def __init__(self, parser: BankruptParserService, region_ids: list[int], parse_full_info: bool, js_wait_time: int, smtp_config: dict, email_service: EmailService):
         super().__init__()
         self.parser = parser
-        self.region_id = region_id
+        self.region_ids = region_ids
+        self.parse_full_info = parse_full_info
+        self.js_wait_time = js_wait_time
+        self.smtp_config = smtp_config
         self.is_running = True
+        self.email_service = email_service
+        self.base_url = "https://bankrot.fedresurs.ru/bankrupts"
 
 
     def run(self):
         asyncio.run(self.parse())
 
 
-    async def parse(self):
+    async def send_email(self, result: dict):
         try:
-            url = f"https://bankrot.fedresurs.ru/bankrupts?regionId={self.region_id}&isActiveLegalCase=true&offset=0&limit=100"
-            page = await self.parser.load_page(url)
+            # Format email subject
+            subject = format_email_subject( "Банкротство {} ", inn=result["inn"] )
+            
+            # Send email
+            self.email_service.send_email(
+                self.smtp_config,
+                subject,
+                f"Ссылка на публикацию: {result['url']}"
+            )
+            self.log_signal.emit(f"Email sent for INN {result['inn']}")
+        except Exception as e:
+            self.log_signal.emit(f"Error sending email for INN {result['inn']}: {str(e)}")
 
-            await page.wait_for_selector("app-bankrupt-result-card-company")
-            cards = await page.locator("app-bankrupt-result-card-company").all()
-            self.log_signal.emit(f"Cards found: {len(cards)}")
 
-            # TODO: Add page offset changing
-            for i, card in enumerate(cards):
+    async def parse(self):
+        # Parse bankruptcy data for selected regions
+        try:
+            for region_id in self.region_ids:
                 if not self.is_running:
                     self.log_signal.emit("Parser stopped")
                     break
 
-                try:
-                    card_soup = BeautifulSoup(await card.inner_html(), "html.parser")
-                    result = await self.parser.parse_card(page, card_soup, card)
-                    if result:
-                        self.result_signal.emit(result)
-                        self.log_signal.emit(f"Card proceed {i}: INN={result['inn']}, URL={result['url']}")
-                except Exception as e:
-                    self.log_signal.emit(f"Error while card processing {i}: {str(e)}")
+                self.log_signal.emit(f"Starting parsing for region ID: {region_id}")
+                url = f"{self.base_url}?regionId={region_id}&isActiveLegalCase=true&offset=0&limit=100"
+                page = await self.parser.load_page(url, wait_time=self.js_wait_time)
+                await page.wait_for_selector("app-bankrupt-result-card-company")
+                
+                processed_inns = set()  # Track processed INNs to avoid duplicates
+
+                while self.is_running:
+                    cards = await page.locator("app-bankrupt-result-card-company").all()
+                    self.log_signal.emit(f"Found cards: {len(cards)}")
+
+                    new_cards_processed = False
+                    for i, card in enumerate(cards):
+                        if not self.is_running:
+                            self.log_signal.emit("Parser stopped")
+                            break
+
+                        try:
+                            card_soup = BeautifulSoup(await card.inner_html(), "html.parser")
+                            self.parser.parse_full_info = self.parse_full_info
+                            result = await self.parser.parse_card(page, card_soup, card, wait_time=self.js_wait_time)
+                            if result and result["inn"] not in processed_inns:
+                                result["region_id"] = region_id
+                                processed_inns.add(result["inn"])
+                                self.result_signal.emit(result)
+                                self.log_signal.emit(f"Processed card {i}: INN={result['inn']}, URL={result['url']}")
+
+                                if result['url'] is not None:
+                                    await self.send_email(result)
+
+                        except Exception as e:
+                            self.log_signal.emit(f"Error processing card {i}: {str(e)}")
+                            continue
+
+                        new_cards_processed = True
+
+                    if i == len(cards) - 1 and not new_cards_processed:
+                        # Check for more cards
+                        load_more_button = page.locator("button.btn.btn_load_more")
+                        if await load_more_button.is_visible() and await load_more_button.is_enabled() and new_cards_processed:
+                            self.log_signal.emit("Clicking 'Load More' button")
+                            await load_more_button.click()
+                            await page.wait_for_timeout(self.js_wait_time)
+                        else:
+                            self.log_signal.emit("No more cards to load or button disabled")
+                            break
+
+                if page:
+                    await page.close()
 
         except Exception as e:
-            self.log_signal.emit(f"Parcing error: {str(e)}")
+            self.log_signal.emit(f"Parsing error: {str(e)}")
         finally:
-            if page:
-                await page.close()
             self.finished_signal.emit()
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Bankrupt Parser")
-        self.setGeometry(100, 100, 1200, 600)
+        self.setWindowTitle("Парсер Банкротств")
+        self.setGeometry(100, 100, 1200, 800)
         self.parser_thread = None
 
-        # Services initialization
+        # Initialize services
+        self.email_service = EmailService()
         self.db_service = DatabaseService()
-        self.parser_service = BankruptParserService()
+        self.parser_service = BankruptParserService(db_service=self.db_service)
 
-        # Logger setup
+        # Setup logging
         self.logger = setup_logger("App", "Logs", f"App_Log_{current_formatted_time()}.log")
 
-        # UI initialization
+        # Initialize UI
         self.init_ui()
+
+        # Load regions
+        self.populate_region_list()
 
 
     def init_ui(self):
-        # Main widet  and layout
+        # Setup the main UI
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # Control Panel
-        control_layout = QHBoxLayout()
-        main_layout.addLayout(control_layout)
+        # Control panel
+        control_group = QGroupBox("Управление")
+        control_layout = QVBoxLayout()
+        control_group.setLayout(control_layout)
+        main_layout.addWidget(control_group)
 
-        # Region Selection
-        self.region_combo = QComboBox()
-        self.region_combo.addItems([f"Регион {i}" for i in range(1, 10)])  # Пример регионов
-        control_layout.addWidget(QLabel("Регион:"))
-        control_layout.addWidget(self.region_combo)
+        # Region file selection
+        file_layout = QHBoxLayout()
+        self.select_file_button = QPushButton("Выбрать файл регионов")
+        self.select_file_button.clicked.connect(self.select_regions_file)
+        file_layout.addWidget(self.select_file_button)
+        self.file_label = QLabel("Файл не выбран")
+        file_layout.addWidget(self.file_label)
+        file_layout.addStretch()
+        control_layout.addLayout(file_layout)
 
-        # Buttons
+        # Region selection
+        regions_layout = QHBoxLayout()
+        self.region_list = QListWidget()
+        self.region_list.setSelectionMode(QListWidget.MultiSelection)
+        self.region_list.setMinimumHeight(100)
+        regions_layout.addWidget(QLabel("Регионы:"))
+        regions_layout.addWidget(self.region_list)
+        self.select_all_checkbox = QCheckBox("Выбрать все")
+        self.select_all_checkbox.stateChanged.connect(self.toggle_select_all)
+        regions_layout.addWidget(self.select_all_checkbox)
+        control_layout.addLayout(regions_layout)
+
+        # Parser settings
+        settings_group = QGroupBox("Настройки парсера")
+        settings_layout = QFormLayout()
+        settings_group.setLayout(settings_layout)
+
+        self.full_info_checkbox = QCheckBox("Парсить полную информацию")
+        self.full_info_checkbox.setChecked(True)
+        settings_layout.addRow("Режим парсинга:", self.full_info_checkbox)
+
+        self.js_wait_spinbox = QSpinBox()
+        self.js_wait_spinbox.setRange(1000, 10000)
+        self.js_wait_spinbox.setSingleStep(500)
+        self.js_wait_spinbox.setValue(3000)
+        self.js_wait_spinbox.setSuffix(" мс")
+        settings_layout.addRow("Интервал ожидания JS:", self.js_wait_spinbox)
+
+        control_layout.addWidget(settings_group)
+
+        # Email settings
+        email_group = QGroupBox("Настройки отправки писем")
+        email_layout = QFormLayout()
+        email_group.setLayout(email_layout)
+
+        self.smtp_host_edit = QLineEdit()
+        self.smtp_host_edit.setText("smtp.yandex.ru")
+        email_layout.addRow("SMTP Хост:", self.smtp_host_edit)
+
+        self.smtp_port_edit = QLineEdit()
+        self.smtp_port_edit.setText("587")
+        email_layout.addRow("SMTP Порт:", self.smtp_port_edit)
+
+        self.email_user_edit = QLineEdit()
+        email_layout.addRow("Email Пользователь:", self.email_user_edit)
+
+        self.email_pass_edit = QLineEdit()
+        self.email_pass_edit.setEchoMode(QLineEdit.Password)
+        email_layout.addRow("Пароль:", self.email_pass_edit)
+
+        self.email_recipient_edit = QLineEdit()
+        email_layout.addRow("Получатель:", self.email_recipient_edit)
+
+        control_layout.addWidget(email_group)
+
+        # Control buttons
+        parser_control_layout = QHBoxLayout()
         self.start_button = QPushButton("Запустить парсер")
         self.start_button.clicked.connect(self.start_parsing)
-        control_layout.addWidget(self.start_button)
-
-        self.stop_button = QPushButton("Остановить")
+        parser_control_layout.addWidget(self.start_button)
+        self.stop_button = QPushButton("Остановить парсер")
         self.stop_button.clicked.connect(self.stop_parsing)
         self.stop_button.setEnabled(False)
-        control_layout.addWidget(self.stop_button)
+        parser_control_layout.addWidget(self.stop_button)
+        parser_control_layout.addStretch()
+        control_layout.addLayout(parser_control_layout)
 
-        self.export_button = QPushButton("Экспорт в CSV")
-        self.export_button.clicked.connect(self.export_to_csv)
-        control_layout.addWidget(self.export_button)
-
-        # Таблица результатов
+        # Results table
         self.result_table = QTableWidget()
-        self.result_table.setColumnCount(3)
-        self.result_table.setHorizontalHeaderLabels(["INN", "Status", "URL"])
+        self.result_table.setColumnCount(4)
+        self.result_table.setHorizontalHeaderLabels(["ИНН", "Статус", "URL", "Регион ID"])
         self.result_table.setRowCount(0)
         self.result_table.setColumnWidth(0, 150)
         self.result_table.setColumnWidth(1, 100)
         self.result_table.setColumnWidth(2, 600)
+        self.result_table.setColumnWidth(3, 100)
         main_layout.addWidget(self.result_table)
 
-        # Поле логов
+        # Log area
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
         self.log_area.setFont(QFont("Courier", 10))
+        self.log_area.setMinimumHeight(200)
         main_layout.addWidget(self.log_area)
 
 
+    def select_regions_file(self):
+        # Open file dialog to select regions file and load it into DB
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать файл регионов", "", "Текстовые файлы (*.txt)"
+        )
+        if file_path:
+            try:
+                self.db_service.clear_regions()
+                with open(file_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and " - " in line:
+                            name, region_id = line.split(" - ")
+                            region_id = int(region_id.strip())
+                            self.db_service.insert_region(region_id, name.strip())
+                self.logger.info(f"Regions loaded from {file_path} into DB")
+                self.file_label.setText(os.path.basename(file_path))
+                self.populate_region_list()
+            except Exception as e:
+                self.logger.error(f"Error loading regions from {file_path}: {e}")
+                QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить регионы: {str(e)}")
+
+
+    def populate_region_list(self):
+        # Populate region list from database
+        self.region_list.clear()
+        try:
+            regions = self.db_service.get_regions()
+            if not regions:
+                self.logger.warning("No regions found in database")
+                self.file_label.setText("Файл не выбран, регионы отсутствуют")
+            for region_id, name in regions:
+                item = QListWidgetItem(f"{name} ({region_id})")
+                item.setData(Qt.UserRole, region_id)
+                self.region_list.addItem(item)
+        except Exception as e:
+            self.logger.error(f"Error populating region list: {e}")
+            QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить регионы: {str(e)}")
+
+
+    def toggle_select_all(self, state):
+        # Select or deselect all regions
+        for i in range(self.region_list.count()):
+            item = self.region_list.item(i)
+            item.setSelected(state == Qt.Checked)
+
+
     def start_parsing(self):
-        region_id = self.region_combo.currentIndex() + 1
-        self.logger.info(f"Starting parsing for region {region_id}")
+        # Start parsing for selected regions
+        selected_items = self.region_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один регион")
+            return
+
+        region_ids = [item.data(Qt.UserRole) for item in selected_items]
+        self.logger.info(f"Starting parsing for regions: {region_ids}")
+
+        # Collect SMTP settings
+        smtp_config = {
+            "smtp_server": self.smtp_host_edit.text(),
+            "smtp_port": int(self.smtp_port_edit.text()) if self.smtp_port_edit.text().isdigit() else 587,
+            "user": self.email_user_edit.text(),
+            "password": self.email_pass_edit.text(),
+            "recipient": self.email_recipient_edit.text()
+        }
 
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.result_table.setRowCount(0)
 
-        self.parser_thread = ParserThread(self.parser_service, region_id)
+        self.parser_thread = ParserThread(
+            self.parser_service,
+            region_ids,
+            self.full_info_checkbox.isChecked(),
+            self.js_wait_spinbox.value(),
+            smtp_config,
+            self.email_service
+        )
         self.parser_thread.log_signal.connect(self.update_log)
         self.parser_thread.result_signal.connect(self.update_table)
         self.parser_thread.finished_signal.connect(self.parsing_finished)
@@ -145,64 +337,47 @@ class MainWindow(QMainWindow):
 
 
     def stop_parsing(self):
+        # Stop the parser
         if self.parser_thread:
             self.parser_thread.is_running = False
             self.stop_button.setEnabled(False)
 
 
     def update_log(self, message):
+        # Update log area with message
         self.log_area.append(message)
         self.logger.info(message)
 
 
     def update_table(self, result):
+        # Update results table with parsed data
         row = self.result_table.rowCount()
         self.result_table.insertRow(row)
         self.result_table.setItem(row, 0, QTableWidgetItem(result["inn"]))
         self.result_table.setItem(row, 1, QTableWidgetItem(str(result["status"])))
         self.result_table.setItem(row, 2, QTableWidgetItem(result["url"] or "N/A"))
+        self.result_table.setItem(row, 3, QTableWidgetItem(str(result["region_id"])))
 
-        # Сохраняем в базу
         try:
-            region_id = self.region_combo.currentIndex() + 1
             self.db_service.insert_organization(
-                result["inn"], result["status"], result["url"], region_id
+                result["inn"], result["status"], result["url"], result["region_id"]
             )
         except Exception as e:
-            self.update_log(f"Ошибка сохранения в базу: {str(e)}")
+            self.update_log(f"Error saving to database: {str(e)}")
 
 
     def parsing_finished(self):
+        # Handle parsing completion
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.update_log("Парсинг завершен")
-
-
-    def export_to_csv(self):
-        region_id = self.region_combo.currentIndex() + 1
-        organizations = self.db_service.get_organizations_by_region(region_id)
-
-        if not organizations:
-            QMessageBox.warning(self, "Экспорт", "Нет данных для экспорта")
-            return
-
-        file_path, _ = QFileDialog.getSaveFileName(self, "Сохранить CSV", "", "CSV Files (*.csv)")
-        if file_path:
-            try:
-                with open(file_path, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["INN", "Status", "URL"])
-                    writer.writerows(organizations)
-                QMessageBox.information(self, "Экспорт", "Данные успешно экспортированы")
-            except Exception as e:
-                QMessageBox.critical(self, "Ошибка", f"Не удалось экспортировать: {str(e)}")
+        self.update_log("Parsing completed")
 
 
     def closeEvent(self, event):
+        # Handle window close
         self.stop_parsing()
-        # if self.parser_service.browser:
-        #     asyncio.run(self.parser_service.browser.close())
         event.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
